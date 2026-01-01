@@ -1,0 +1,74 @@
+# FDRS Configuration File
+# Customize capacity and performance values for your environment
+
+# Storage I/O Capacity (MBps - Megabytes per second)
+# Default assumes dual 32Gbps SAN connections (2 x 32Gbps / 8 bits = 8000 MBps, typically limited to ~4000)
+# Adjust based on your actual storage infrastructure
+storage:
+  disk_io_capacity_mbps: 4000  # Default: 4000 MBps for 2x32Gbps SAN
+
+# Network Capacity (MBps - Megabytes per second)
+# Default: 1250 MBps (assumes dual 10Gbps NICs: 2 x 10Gbps / 8 bits = 2500 MBps, accounting for efficiency)
+# Common values:
+#   - 1250 MBps: 2 x 10GbE (10 Gigabit Ethernet)
+#   - 2500 MBps: 4 x 10GbE or 2 x 25GbE
+#   - 6250 MBps: 4 x 25GbE
+#   - 12500 MBps: 4 x 50GbE or 2 x 100GbE
+network:
+  bandwidth_mbps: 1250  # Default: 1250 MBps
+
+# Performance Thresholds (for future use in advanced balancing)
+performance:
+  # CPU context switch threshold - if exceeds this %, alert on potential CPU contention
+  cpu_ready_percent_threshold: 10.0
+  
+  # Memory swap rate threshold (pages/sec) - if exceeds this, memory pressure exists
+  memory_swap_threshold: 1000
+  
+  # Disk latency threshold (milliseconds)
+  disk_latency_threshold_ms: 20
+
+# Migration Settings
+migration:
+  # Default maximum migrations per single run (can be overridden by --max-migrations)
+  default_max_migrations: 20
+  
+  # VM relocation timeout in seconds (time to wait for vMotion to complete)
+  migration_timeout_seconds: 300
+  
+  # High watermark thresholds to prevent host overload (percentage of total capacity)
+  host_cpu_high_watermark_percent: 90
+  host_memory_high_watermark_percent: 90
+
+# Logging Configuration
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+  
+  # Log file location (optional, if empty logs to stdout only)
+  file: ""
+
+# Iterative Planning (for guaranteed convergence)
+iterative:
+  # Maximum number of planning iterations when --iterative flag is used
+  # Higher values increase convergence likelihood but add execution time
+  # Typical scenarios converge in 2-3 iterations
+  max_iterations: 3
+  
+  # Threshold multiplier for loosening constraints on iterations 2+
+  # When aggressiveness is N, iteration 2+ uses N/multiplier
+  # Example: aggressiveness=3, multiplier=1.05 → iteration 2 uses aggressiveness=2.8 (effectively 2)
+  # Higher multiplier = more lenient on subsequent iterations = less deadlock risk
+  threshold_multiplier: 1.05
+  
+  # Timeout (seconds) for each iterative planning cycle (future enhancement)
+  # Prevents infinite loops if convergence check fails
+  convergence_timeout_seconds: 300
+
+# Performance Optimization
+optimization:
+  # Enable caching of percentage lists for faster recalculation
+  enable_percentage_cache: true
+  
+  # Enable prefix caching for VM anti-affinity grouping
+  enable_prefix_cache: true
