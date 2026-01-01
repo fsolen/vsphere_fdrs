@@ -442,4 +442,5 @@ python fdrs.py --vcenter vc01.fatihsolen.com --username admin --apply-anti-affin
 **Document Version:** 1.0  
 **Last Updated:** January 2026  
 **Status:** Active  
-**Maintainer:** FDRS Development Team
+**Maintainer:** Fatih Solen
+
