@@ -5,8 +5,12 @@ logger = logging.getLogger('fdrs')
 class LoadEvaluator:
     def __init__(self, hosts):
         self.hosts = hosts
+        self._cache_percentage_lists = None
 
     def get_resource_percentage_lists(self):
+        if self._cache_percentage_lists is not None:
+            return self._cache_percentage_lists
+            
         cpu_percentages = []
         mem_percentages = []
         disk_percentages = []
@@ -14,7 +18,8 @@ class LoadEvaluator:
 
         if not isinstance(self.hosts, list) or not self.hosts:
             logger.warning(f"[LoadEvaluator] Hosts list is not a list or is empty (type: {type(self.hosts)}). Cannot calculate percentage lists.")
-            return [], [], [], []
+            self._cache_percentage_lists = ([], [], [], [])
+            return self._cache_percentage_lists
 
         for host_data in self.hosts:
             if not isinstance(host_data, dict):
@@ -44,8 +49,9 @@ class LoadEvaluator:
             net_capacity = host_data.get('network_capacity', 0.0)
             net_perc = (net_usage / net_capacity * 100.0) if net_capacity > 0 else 0.0
             net_percentages.append(net_perc)
-            
-        return cpu_percentages, mem_percentages, disk_percentages, net_percentages
+        
+        self._cache_percentage_lists = (cpu_percentages, mem_percentages, disk_percentages, net_percentages)
+        return self._cache_percentage_lists
 
     def get_thresholds(self, aggressiveness=3):
         mapping = {
