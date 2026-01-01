@@ -1,4 +1,3 @@
- 
 import logging
 
 logger = logging.getLogger('fdrs')
@@ -7,7 +6,15 @@ class ConstraintManager:
     def __init__(self, cluster_state):
         self.cluster_state = cluster_state
         self.vm_distribution = {}
-        self.violations = [] 
+        self.violations = []
+        self._vm_prefix_cache = {} 
+
+
+    def _get_vm_prefix(self, vm_name):
+        """Cache prefix extraction for faster lookups."""
+        if vm_name not in self._vm_prefix_cache:
+            self._vm_prefix_cache[vm_name] = vm_name.rstrip('0123456789') or vm_name
+        return self._vm_prefix_cache[vm_name]
 
     def enforce_anti_affinity(self):
         '''
@@ -27,8 +34,7 @@ class ConstraintManager:
                 logger.warning(f"[ConstraintManager] VM with invalid name or missing name attribute skipped: {getattr(vm, 'name', 'UnknownVM')}")
                 continue
     
-            # Strip trailing digits to form the group key
-            short_name = vm.name.rstrip('0123456789') or vm.name
+            short_name = self._get_vm_prefix(vm.name)
     
             # Add VM to the group
             self.vm_distribution.setdefault(short_name, []).append(vm)
@@ -101,7 +107,7 @@ class ConstraintManager:
         if not hasattr(vm_to_move, 'name') or len(vm_to_move.name) < 3:
             logger.warning(f"[ConstraintManager] Invalid vm_to_move object: {vm_to_move}")
             return None
-        vm_prefix = vm_to_move.name.rstrip('0123456789') or vm_to_move.name
+        vm_prefix = self._get_vm_prefix(vm_to_move.name)
         
         if not self.vm_distribution: 
             logger.info("[ConstraintManager] vm_distribution is empty, populating it first.")
