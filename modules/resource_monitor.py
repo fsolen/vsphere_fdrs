@@ -9,10 +9,11 @@ class ResourceMonitor:
     Monitor resources (CPU, Memory, Disk I/O, Network I/O) of VMs and Hosts
     """
 
-    def __init__(self, service_instance):
+    def __init__(self, service_instance, config=None):
         self.service_instance = service_instance
         self.performance_manager = service_instance.content.perfManager
         self.counter_map = self._build_counter_map()
+        self.config = config
 
     def _build_counter_map(self):
         """
@@ -34,45 +35,18 @@ class ResourceMonitor:
         metric_id = self.counter_map.get(metric_name)
 
         entity_name_for_log = getattr(entity, 'name', str(entity))
-        logger.debug(f"[_get_performance_data] Processing entity: {entity_name_for_log}, Type: {type(entity)}, For Metric: {metric_name}")
 
         if isinstance(entity, str):
-            logger.error(f"[_get_performance_data] CRITICAL: Entity for metric '{metric_name}' is a STRING: '{entity}'. This will cause _moId error.")
+            logger.error(f"[_get_performance_data] Entity for metric '{metric_name}' is a STRING, cannot query.")
             return 0
 
-        if not hasattr(entity, '_moId'):
-            logger.error(f"[_get_performance_data] CRITICAL: Entity '{entity_name_for_log}' of type {type(entity)} does not have _moId attribute. Metric: {metric_name}")
+        if not hasattr(entity, '_moId') or entity._moId is None:
+            logger.warning(f"[_get_performance_data] Entity '{entity_name_for_log}' has no valid _moId.")
             return 0
-        
-        if entity._moId is None:
-            logger.error(f"[_get_performance_data] CRITICAL: Entity '{entity_name_for_log}' of type {type(entity)} has _moId value of None. Metric: {metric_name}")
-            return 0
-
-        logger.debug(f"[_get_performance_data] Entity '{entity_name_for_log}' appears to be a valid managed object with _moId: {entity._moId}")
-
 
         if not metric_id:
             logger.warning(f"Metric ID for {metric_name} not found in counter map for entity {entity_name_for_log}!")
             return 0
-
-        logger.debug(f"[_get_performance_data] About to call QueryPerf for entity '{entity_name_for_log}' (_moId: {entity._moId}).")
-        
-        si_type = type(self.service_instance)
-        logger.debug(f"[_get_performance_data] Type of self.service_instance: {si_type}")
-        if not hasattr(self.service_instance, '_moId'):
-            logger.error("[_get_performance_data] CRITICAL: self.service_instance has no _moId!")
-        else:
-            logger.debug(f"[_get_performance_data] self.service_instance._moId: {self.service_instance._moId}")
-
-        content_type = type(self.service_instance.content)
-        logger.debug(f"[_get_performance_data] Type of self.service_instance.content: {content_type}")
-
-        perf_manager_type = type(self.performance_manager)
-        logger.debug(f"[_get_performance_data] Type of self.performance_manager: {perf_manager_type}")
-        if not hasattr(self.performance_manager, '_moId'):
-            logger.error("[_get_performance_data] CRITICAL: self.performance_manager has no _moId!")
-        else:
-            logger.debug(f"[_get_performance_data] self.performance_manager._moId: {self.performance_manager._moId}")
 
         query_spec_list = [
             vim.PerformanceManager.QuerySpec(
@@ -84,7 +58,6 @@ class ResourceMonitor:
         ]
 
         try:
-            logger.debug(f"[_get_performance_data] Attempting QueryPerf for entity: {getattr(entity, 'name', str(entity))} (_moId: {getattr(entity, '_moId', 'N/A')})")
             query_results = self.performance_manager.QueryPerf(querySpec=query_spec_list)
             
             if query_results and len(query_results) > 0:
@@ -93,26 +66,10 @@ class ResourceMonitor:
                     metric_series = metric_series_list[0]
                     if hasattr(metric_series, 'value') and metric_series.value and len(metric_series.value) > 0:
                         scalar_value = metric_series.value[0]
-                        if scalar_value is None:
-                            logger.warning(f"Metric {metric_name} for {entity_name_for_log} has a None value in its series.")
-                            return 0
-                        return scalar_value
-                    else:
-                        logger.warning(f"Metric {metric_name} for {entity_name_for_log} has empty or missing 'value' list in its series.")
-                else:
-                    logger.warning(f"No metric series list found for {metric_name} on {entity_name_for_log}.")
-            else:
-                logger.debug(f"No performance data returned for {metric_name} on {entity_name_for_log}. This might be normal.")
+                        return scalar_value if scalar_value is not None else 0
             return 0
-
-        except AttributeError as ae:
-
-            logger.error(f"[_get_performance_data] AttributeError caught for entity '{entity_name_for_log}' (_moId: {getattr(entity, '_moId', 'N/A')}) during QueryPerf or result processing. Exact error: {str(ae)}")
-            logger.error(f"[_get_performance_data] Entity type processed was: {type(entity)}")
-            return 0 
-        
         except Exception as e:
-            logger.error(f"Error fetching or processing performance data for {metric_name} on {entity_name_for_log} (Type: {type(entity)}): {e}")
+            logger.warning(f"Error fetching {metric_name} for {entity_name_for_log}: {e}")
             return 0
 
     def get_vm_metrics(self, vm):
@@ -174,11 +131,18 @@ class ResourceMonitor:
             host_metrics["cpu_capacity"] = host.summary.hardware.numCpuCores * host.summary.hardware.cpuMhz
             host_metrics["memory_capacity"] = host.summary.hardware.memorySize / (1024 * 1024)  # Convert B to MB
             
-            # Disk I/O capacity is an estimated value.
-            host_metrics["disk_io_capacity"] = 4000  # for 2x32 Gbit SAN
+            # Disk I/O capacity from config (default: 4000 MBps for 2x32 Gbit SAN)
+            if self.config:
+                host_metrics["disk_io_capacity"] = self.config.get_storage_disk_io_capacity()
+            else:
+                host_metrics["disk_io_capacity"] = 4000  # Fallback default
             
-            # Network capacity calculation
-            network_capacity_val = 1250.0 # Default value as float
+            # Network capacity calculation (from config or default)
+            if self.config:
+                network_capacity_val = self.config.get_network_bandwidth()
+                logger.debug(f"[ResourceMonitor] Using network bandwidth from config: {network_capacity_val} MBps for host '{host.name}'.")
+            else:
+                network_capacity_val = 1250.0  # Default: 1250 MBps (assumes dual 10GbE)
             if (host.config and hasattr(host.config, 'network') and 
                 host.config.network and hasattr(host.config.network, 'pnic') and 
                 host.config.network.pnic):
