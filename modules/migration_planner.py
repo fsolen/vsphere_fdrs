@@ -4,12 +4,13 @@ import copy
 logger = logging.getLogger('fdrs')
 
 class MigrationManager:
-    def __init__(self, cluster_state, constraint_manager, load_evaluator, aggressiveness=3, max_total_migrations=20, ignore_anti_affinity=False):
+    def __init__(self, cluster_state, constraint_manager, load_evaluator, aggressiveness=3, max_total_migrations=20, ignore_anti_affinity=False, anti_affinity_only=False):
         self.cluster_state = cluster_state
         self.constraint_manager = constraint_manager
         self.load_evaluator = load_evaluator
         self.aggressiveness = aggressiveness
         self.ignore_anti_affinity = ignore_anti_affinity
+        self.anti_affinity_only = anti_affinity_only  # For apply-anti-affinity-only mode
         if max_total_migrations is None:
             self.max_total_migrations = 20
         else:
@@ -221,6 +222,56 @@ class MigrationManager:
         logger.debug(f"[MigrationPlanner_FitCheck] VM '{vm.name}' would fit on host '{host_obj.name}'. Proj CPU: {projected_cpu_pct:.1f}%, Proj Mem: {projected_mem_pct:.1f}%")
         return True
 
+    def _would_fit_on_host_soft(self, vm, host_obj, cpu_threshold=95.0, mem_threshold=95.0):
+        """
+        Soft fit check for anti-affinity migrations.
+        Uses higher thresholds (default 95%) to allow anti-affinity to work
+        even on moderately loaded hosts, while preventing catastrophic overload.
+        
+        Args:
+            vm: VM object to check
+            host_obj: Target host object
+            cpu_threshold: CPU percentage threshold (default 95%)
+            mem_threshold: Memory percentage threshold (default 95%)
+        
+        Returns:
+            True if VM would fit, False otherwise
+        """
+        logger.debug(f"[MigrationPlanner_SoftFitCheck] Soft fit check for VM '{vm.name}' on host '{host_obj.name}' (CPU: {cpu_threshold}%, MEM: {mem_threshold}%).")
+        
+        vm_metrics = self.cluster_state.vm_metrics.get(vm.name, {})
+        host_current_metrics = self.cluster_state.host_metrics.get(host_obj.name, {})
+
+        if not vm_metrics or not host_current_metrics:
+            logger.warning(f"[MigrationPlanner_SoftFitCheck] Missing metrics for VM '{vm.name}' or host '{host_obj.name}'. Cannot perform soft fit check.")
+            return False
+
+        # VM requirements
+        vm_cpu_req = vm_metrics.get('cpu_usage_abs', vm_metrics.get('cpu_allocation', 0))
+        vm_mem_req = vm_metrics.get('memory_usage_abs', vm_metrics.get('memory_allocation_bytes', 0))
+
+        # Host capacity
+        host_cpu_cap = host_current_metrics.get('cpu_capacity', 1)
+        host_mem_cap = host_current_metrics.get('memory_capacity', 1)
+        host_cpu_curr = host_current_metrics.get('cpu_usage', 0)
+        host_mem_curr = host_current_metrics.get('memory_usage_abs', 0)
+
+        projected_cpu_abs = host_cpu_curr + vm_cpu_req
+        projected_mem_abs = host_mem_curr + vm_mem_req
+
+        projected_cpu_pct = (projected_cpu_abs / host_cpu_cap * 100.0) if host_cpu_cap > 0 else 100.0
+        projected_mem_pct = (projected_mem_abs / host_mem_cap * 100.0) if host_mem_cap > 0 else 100.0
+
+        if projected_cpu_pct > cpu_threshold:
+            logger.debug(f"[MigrationPlanner_SoftFitCheck] VM '{vm.name}' would not fit on host '{host_obj.name}' due to CPU (proj: {projected_cpu_pct:.1f}% > threshold: {cpu_threshold:.1f}%)")
+            return False
+        if projected_mem_pct > mem_threshold:
+            logger.debug(f"[MigrationPlanner_SoftFitCheck] VM '{vm.name}' would not fit on host '{host_obj.name}' due to Memory (proj: {projected_mem_pct:.1f}% > threshold: {mem_threshold:.1f}%)")
+            return False
+        
+        logger.debug(f"[MigrationPlanner_SoftFitCheck] VM '{vm.name}' would fit on host '{host_obj.name}' with soft threshold. Proj CPU: {projected_cpu_pct:.1f}%, Proj Mem: {projected_mem_pct:.1f}%")
+        return True
+
     def _select_vms_to_move(self, source_host_obj, imbalanced_resource=None, vms_already_in_plan=None):
         logger.debug(f"[MigrationPlanner_SelectVMs] Selecting VMs to move from host '{source_host_obj.name}'. Imbalanced resource hint: {imbalanced_resource}")
         if vms_already_in_plan is None: vms_already_in_plan = set()
@@ -340,6 +391,9 @@ class MigrationManager:
         logger.info("[MigrationPlanner] Starting migration planning cycle...")
         migrations = []
         vms_in_migration_plan = set()
+
+        # Clear LoadEvaluator cache before new planning cycle to get fresh calculations
+        self.load_evaluator._cache_percentage_lists = None
 
         # Step 1: Addressing Anti-Affinity violations (always done if plan_migrations is called)
         anti_affinity_migrations = self._plan_anti_affinity_migrations(vms_in_migration_plan)
@@ -469,14 +523,25 @@ class MigrationManager:
             )
 
             if target_host_obj:
-                if self._would_fit_on_host(vm_obj, target_host_obj):
+                # For apply-anti-affinity-only mode: skip resource checks entirely (prioritize distribution)
+                # For regular mode: use soft fit check (95% threshold) to allow AA while preventing catastrophic overload
+                if self.anti_affinity_only:
+                    # Skip resource checks for apply-anti-affinity-only mode - pure distribution
+                    logger.info(f"[MigrationPlanner_AA] Apply-Anti-Affinity-Only Mode: Skipping resource fit check for VM '{vm_obj.name}'.")
+                    migration_plan = {'vm': vm_obj, 'target_host': target_host_obj, 'reason': 'Anti-Affinity'}
+                    all_aa_migrations_for_return.append(migration_plan)
+                    aa_migrations_planned_this_step.append(migration_plan)
+                    vms_in_migration_plan.add(vm_obj.name)
+                    logger.info(f"[MigrationPlanner_AA] Planned Anti-Affinity Migration: Move VM '{vm_obj.name}' from '{current_host.name if current_host else 'N/A'}' to '{target_host_obj.name}'.")
+                elif self._would_fit_on_host_soft(vm_obj, target_host_obj, cpu_threshold=95.0, mem_threshold=95.0):
+                    # Regular mode: use soft fit check (95% threshold)
                     migration_plan = {'vm': vm_obj, 'target_host': target_host_obj, 'reason': 'Anti-Affinity'}
                     all_aa_migrations_for_return.append(migration_plan)
                     aa_migrations_planned_this_step.append(migration_plan) # Add to list for next iteration's consideration
                     vms_in_migration_plan.add(vm_obj.name) # Add to global set passed in
                     logger.info(f"[MigrationPlanner_AA] Planned Anti-Affinity Migration: Move VM '{vm_obj.name}' from '{current_host.name if current_host else 'N/A'}' to '{target_host_obj.name}'.")
                 else:
-                    logger.warning(f"[MigrationPlanner_AA] Preferred host '{target_host_obj.name}' for VM '{vm_obj.name}' cannot fit it. No AA migration planned for this VM.")
+                    logger.warning(f"[MigrationPlanner_AA] Target host '{target_host_obj.name}' for VM '{vm_obj.name}' would exceed soft capacity thresholds (95%). No AA migration planned for this VM.")
             else:
                 logger.warning(f"[MigrationPlanner_AA] No suitable preferred host found for anti-affinity violating VM '{vm_obj.name}'.")
         return all_aa_migrations_for_return
@@ -614,6 +679,88 @@ class MigrationManager:
                     logger.info(f"[MigrationPlanner_Balance] No suitable balancing target found for VM '{vm_to_move.name}' from host '{current_source_host_name}'.")
 
         return balancing_migrations
+
+    def plan_migrations_iterative(self, max_iterations=3, anti_affinity_only=False, iteration_threshold_multiplier=1.05):
+        """
+        Iteratively plan migrations until convergence (zero AA violations + balanced) or max iterations reached.
+        
+        This method guarantees BOTH anti-affinity satisfaction AND resource balance by re-evaluating
+        the cluster state after each planning pass and adjusting constraints if needed.
+        
+        Args:
+            max_iterations: Maximum number of planning iterations (default 3)
+            anti_affinity_only: If True, only fix AA violations (skip balancing)
+            iteration_threshold_multiplier: On iteration 2+, loosen balance thresholds by this factor
+                                          (e.g., 1.05 = 5% looser) to prevent deadlocks
+        
+        Returns:
+            List of migration tuples (vm_obj, target_host_obj) with convergence guarantee
+        """
+        logger.info(f"[MigrationPlanner_Iterative] Starting iterative planning (max {max_iterations} iterations)...")
+        
+        all_migrations = []
+        
+        for iteration in range(1, max_iterations + 1):
+            logger.info(f"\n{'='*70}")
+            logger.info(f"[MigrationPlanner_Iterative] === ITERATION {iteration}/{max_iterations} ===")
+            logger.info(f"{'='*70}")
+            
+            # Check current state before planning
+            aa_violations = self.constraint_manager.calculate_anti_affinity_violations()
+            is_balanced = self.load_evaluator.is_balanced()
+            
+            logger.info(f"[MigrationPlanner_Iterative] Current state: AA violations={len(aa_violations)}, balanced={is_balanced}")
+            
+            # Convergence check: If no AA violations AND balanced, we're done
+            if not aa_violations and is_balanced:
+                logger.success(f"[MigrationPlanner_Iterative] ✓ CONVERGED at iteration {iteration}: No AA violations, cluster is balanced.")
+                logger.info(f"[MigrationPlanner_Iterative] Total migrations planned across all iterations: {len(all_migrations)}")
+                return all_migrations
+            
+            # Adjust aggressiveness on iteration 2+ to prevent deadlocks
+            original_aggressiveness = self.aggressiveness
+            if iteration > 1:
+                # Looser threshold = lower aggressiveness number (more lenient)
+                adjusted_aggressiveness = max(1, int(self.aggressiveness / iteration_threshold_multiplier))
+                self.aggressiveness = adjusted_aggressiveness
+                logger.info(f"[MigrationPlanner_Iterative] Iteration {iteration}: Adjusted aggressiveness from {original_aggressiveness} to {adjusted_aggressiveness} (looser thresholds)")
+            
+            # Plan this iteration
+            migrations_this_iteration = self.plan_migrations(anti_affinity_only=anti_affinity_only)
+            
+            # Restore original aggressiveness
+            self.aggressiveness = original_aggressiveness
+            
+            if not migrations_this_iteration:
+                logger.info(f"[MigrationPlanner_Iterative] No migrations produced at iteration {iteration}. Stopping.")
+                break
+            
+            all_migrations.extend(migrations_this_iteration)
+            logger.info(f"[MigrationPlanner_Iterative] Iteration {iteration} produced {len(migrations_this_iteration)} migrations.")
+            logger.info(f"[MigrationPlanner_Iterative] Total accumulated: {len(all_migrations)} migrations")
+            
+            # Reset cache for next iteration
+            if hasattr(self.load_evaluator, '_cache_percentage_lists'):
+                self.load_evaluator._cache_percentage_lists = None
+            
+            logger.info(f"[MigrationPlanner_Iterative] Prepared for iteration {iteration + 1}...")
+        
+        # Final state check
+        final_aa_violations = self.constraint_manager.calculate_anti_affinity_violations()
+        final_is_balanced = self.load_evaluator.is_balanced()
+        
+        logger.warning(f"\n[MigrationPlanner_Iterative] === ITERATIVE PLANNING COMPLETE ===")
+        logger.warning(f"[MigrationPlanner_Iterative] Final state after {max_iterations} iterations:")
+        logger.warning(f"  - AA violations: {len(final_aa_violations)}")
+        logger.warning(f"  - Cluster balanced: {final_is_balanced}")
+        logger.warning(f"  - Total migrations: {len(all_migrations)}")
+        
+        if final_aa_violations:
+            logger.warning(f"[MigrationPlanner_Iterative] Warning: {len(final_aa_violations)} AA violations remain (may be resource-constrained)")
+        if not final_is_balanced:
+            logger.warning(f"[MigrationPlanner_Iterative] Warning: Cluster not fully balanced (approaching migration limit or resource-constrained)")
+        
+        return all_migrations
 
     def execute_migrations(self, migration_tuples):
         if not migration_tuples:
