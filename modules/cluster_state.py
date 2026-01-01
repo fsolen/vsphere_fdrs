@@ -4,13 +4,14 @@ import logging
 logger = logging.getLogger('fdrs')
 
 class ClusterState:
-    def __init__(self, service_instance):
+    def __init__(self, service_instance, cluster_name=None):
         self.service_instance = service_instance
+        self.cluster_name = cluster_name  # Optional: filter by specific cluster name
         self.vms = self._get_all_vms()
         self.hosts = self._get_all_hosts()
 
     def _get_all_vms(self):
-        """Get all VMs in the datacenter."""
+        """Get all VMs in the datacenter, optionally filtered by cluster."""
         content = self.service_instance.RetrieveContent()
         container = content.viewManager.CreateContainerView(
             content.rootFolder, [vim.VirtualMachine], True
@@ -19,7 +20,23 @@ class ClusterState:
         container.Destroy()
         
         # Filter out templates and powered off VMs
-        return [vm for vm in vms if not vm.config.template and vm.runtime.powerState == 'poweredOn']
+        active_vms = [vm for vm in vms if not vm.config.template and vm.runtime.powerState == 'poweredOn']
+        
+        # If cluster_name is specified, filter VMs to only those in the specified cluster
+        if self.cluster_name:
+            filtered_vms = []
+            for vm in active_vms:
+                try:
+                    # Get the host this VM is running on, then check the host's cluster
+                    if vm.runtime.host and vm.runtime.host.parent and hasattr(vm.runtime.host.parent, 'name'):
+                        if vm.runtime.host.parent.name == self.cluster_name:
+                            filtered_vms.append(vm)
+                except Exception as e:
+                    logger.debug(f"Could not determine cluster for VM {vm.name}: {e}")
+            
+            return filtered_vms
+        
+        return active_vms
 
     def _get_all_hosts(self):
         """Get all ESXi hosts in the datacenter."""
@@ -31,7 +48,26 @@ class ClusterState:
         container.Destroy()
         
         # Filter out hosts that are not in connected state
-        return [host for host in hosts if host.runtime.connectionState == 'connected']
+        connected_hosts = [host for host in hosts if host.runtime.connectionState == 'connected']
+        
+        # If cluster_name is specified, filter by cluster
+        if self.cluster_name:
+            filtered_hosts = []
+            for host in connected_hosts:
+                try:
+                    if host.parent and hasattr(host.parent, 'name') and host.parent.name == self.cluster_name:
+                        filtered_hosts.append(host)
+                except Exception as e:
+                    logger.debug(f"Could not determine cluster for host {host.name}: {e}")
+            
+            if not filtered_hosts:
+                logger.warning(f"[ClusterState] No hosts found in cluster '{self.cluster_name}'")
+            else:
+                logger.info(f"[ClusterState] Filtered to {len(filtered_hosts)} hosts in cluster '{self.cluster_name}'")
+            
+            return filtered_hosts
+        
+        return connected_hosts
 
     def get_cluster_state(self):
         """
