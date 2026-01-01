@@ -290,4 +290,4 @@ For questions about convergence guarantees, see: [ITERATIVE_CONVERGENCE_GUARANTE
 
 For CLI usage: `python fdrs.py --help`
 
-For configuration: [config/fdrs_config.yaml](config/fdrs_config.yaml)
+For configuration: [../config/fdrs_config.yaml](../config/fdrs_config.yaml)
