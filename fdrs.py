@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
+"""FDRS - Fully Distributed Resource Scheduler for VMware vSphere Standard Edition.
+
+Simulates DRS functionality with anti-affinity groups based on VM name prefixes.
+"""
 
 import argparse
 import getpass
 import logging
 import sys
+from typing import Optional
+
 from modules.banner import print_banner
 from modules.config_loader import ConfigLoader
 from modules.connection_manager import ConnectionManager
@@ -13,8 +19,6 @@ from modules.cluster_state import ClusterState
 from modules.load_evaluator import LoadEvaluator
 from modules.migration_planner import MigrationManager
 from modules.scheduler import Scheduler
-import logging
-import sys
 
 logger = logging.getLogger('fdrs')
 
@@ -53,13 +57,17 @@ def main():
     if not args.password:
         args.password = getpass.getpass("vCenter Password: ")
 
+    # Configure logging based on config file or defaults
+    log_level = logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[logging.StreamHandler(sys.stdout)] 
+        handlers=[logging.StreamHandler(sys.stdout)]
     )
-    logging.getLogger('fdrs').setLevel(logging.INFO)
+    # Reduce noise from pyvmomi
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('pyVmomi').setLevel(logging.WARNING)
     
     # Load configuration
     logger.info("[Main] Loading configuration...")
@@ -87,7 +95,7 @@ def main():
 
     if args.apply_anti_affinity:
         logger.info("Applying anti-affinity rules only (with relaxed resource checks)...")
-        constraint_manager = ConstraintManager(cluster_state)
+        constraint_manager = ConstraintManager(cluster_state, config=config)
         constraint_manager.apply()
         load_evaluator = LoadEvaluator(state['hosts']) 
         migration_planner = MigrationManager(
@@ -122,7 +130,7 @@ def main():
         metrics_list = [m.strip() for m in args.metrics.split(",") if m.strip()]
         
         load_evaluator = LoadEvaluator(state['hosts'])
-        constraint_manager = ConstraintManager(cluster_state)
+        constraint_manager = ConstraintManager(cluster_state, config=config)
 
         migration_planner = MigrationManager(
             cluster_state,
@@ -162,7 +170,7 @@ def main():
 
     logger.info("Running default FDRS workflow (evaluating load and planning migrations if needed)...")
     load_evaluator = LoadEvaluator(state['hosts'])
-    constraint_manager = ConstraintManager(cluster_state)
+    constraint_manager = ConstraintManager(cluster_state, config=config)
     migration_planner = MigrationManager(
         cluster_state,
         constraint_manager,
