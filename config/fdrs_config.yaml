@@ -1,6 +1,28 @@
 # FDRS Configuration File
 # Customize capacity and performance values for your environment
 
+# Anti-Affinity Configuration
+# Controls how VMs are grouped for anti-affinity rules
+anti_affinity:
+  # Prefix extraction mode: 'strip_digits' or 'regex'
+  # - strip_digits: Removes trailing digits from VM names (e.g., webserver01 -> webserver)
+  # - regex: Uses a custom regex pattern to extract the group name
+  mode: strip_digits
+  
+  # Custom regex pattern (only used when mode is 'regex')
+  # Must contain a named group 'prefix' that captures the anti-affinity group name
+  # Examples:
+  #   - '^(?P<prefix>[a-zA-Z]+)' - Capture leading letters only
+  #   - '^(?P<prefix>.+?)[-_]?\d*$' - Capture everything before optional separator and digits
+  #   - '^(?P<prefix>[^-]+)' - Capture everything before first hyphen
+  regex_pattern: '^(?P<prefix>.+?)[-_]?\d*$'
+  
+  # Minimum VM name length to consider for grouping (shorter names are skipped)
+  min_name_length: 2
+  
+  # Minimum group size to enforce anti-affinity (groups with fewer VMs are ignored)
+  min_group_size: 2
+
 # Storage I/O Capacity (MBps - Megabytes per second)
 # Default assumes dual 32Gbps SAN connections (2 x 32Gbps / 8 bits = 8000 MBps, typically limited to ~4000)
 # Adjust based on your actual storage infrastructure

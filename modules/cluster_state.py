@@ -1,14 +1,27 @@
 from pyVmomi import vim
 import logging
+from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger('fdrs')
 
 class ClusterState:
-    def __init__(self, service_instance, cluster_name=None):
+    """Maintains state of cluster VMs, hosts, and their metrics."""
+    
+    __slots__ = ('service_instance', 'cluster_name', 'vms', 'hosts', 'vm_metrics', 'host_metrics')
+    
+    def __init__(self, service_instance, cluster_name: Optional[str] = None):
         self.service_instance = service_instance
-        self.cluster_name = cluster_name  # Optional: filter by specific cluster name
-        self.vms = self._get_all_vms()
-        self.hosts = self._get_all_hosts()
+        self.cluster_name = cluster_name
+        self.vms: List = self._get_all_vms()
+        self.hosts: List = self._get_all_hosts()
+        self.vm_metrics: Dict[str, Dict] = {}
+        self.host_metrics: Dict[str, Dict] = {}
+    
+    def update_metrics(self, resource_monitor) -> None:
+        """Update all VM and host metrics using the provided resource monitor."""
+        self.annotate_vms_with_metrics(resource_monitor)
+        self.annotate_hosts_with_metrics(resource_monitor)
+        self.log_cluster_stats()
 
     def _get_all_vms(self):
         """Get all VMs in the datacenter, optionally filtered by cluster."""
@@ -143,37 +156,59 @@ class ClusterState:
         """
         Build a dictionary mapping VM names to their absolute resource consumption metrics.
         These metrics represent actual resource usage that will be used to calculate host loads.
-        Uses ResourceMonitor for I/O metrics and vm.summary.quickStats for absolute CPU/Memory.
+        
+        Uses batch queries for I/O metrics (more efficient) and vm.summary.quickStats 
+        for absolute CPU/Memory.
         """
         self.vm_metrics = {}
         logger.info("[ClusterState] Starting annotation of VMs with metrics...")
+        
+        # Filter valid VMs first
+        valid_vms = []
         for vm_obj in self.vms:
-            vm_name_for_log = "UnknownVMObject" # Default
+            vm_name = getattr(vm_obj, 'name', None)
+            if not vm_name:
+                logger.warning("[ClusterState.annotate_vms] VM without name skipped")
+                continue
+            if not hasattr(vm_obj, '_moId') or vm_obj._moId is None:
+                logger.warning(f"[ClusterState.annotate_vms] VM {vm_name} has missing _moId. Skipping.")
+                continue
+            valid_vms.append(vm_obj)
+        
+        # Use batch query for I/O metrics (disk and network)
+        batch_io_metrics = {}
+        if hasattr(resource_monitor, 'get_batch_vm_metrics'):
             try:
-                vm_name_for_log = getattr(vm_obj, 'name', 'UnknownVMObject_NoNameAttr')
-                logger.debug(f"[ClusterState.annotate_vms] Processing VM: {vm_name_for_log}, Type: {type(vm_obj)}")
+                batch_io_metrics = resource_monitor.get_batch_vm_metrics(valid_vms)
+                logger.debug(f"[ClusterState] Batch query returned metrics for {len(batch_io_metrics)} VMs")
+            except Exception as e:
+                logger.warning(f"[ClusterState] Batch query failed: {e}. Falling back to individual queries.")
+        
+        # Process each VM
+        for vm_obj in valid_vms:
+            vm_name = vm_obj.name
+            try:
+                # Get I/O metrics from batch result or fall back to individual query
+                if vm_name in batch_io_metrics:
+                    io_metrics = batch_io_metrics[vm_name]
+                else:
+                    io_metrics = resource_monitor.get_vm_metrics(vm_obj)
                 
-                if not hasattr(vm_obj, '_moId') or vm_obj._moId is None:
-                    logger.warning(f"[ClusterState.annotate_vms] VM {vm_name_for_log} has missing or None _moId. Skipping its metric annotation.")
-                    continue
-                
-                # Original logic for a VM
-                rm_vm_metrics = resource_monitor.get_vm_metrics(vm_obj)
-                self.vm_metrics[vm_obj.name] = {
+                self.vm_metrics[vm_name] = {
                     'cpu_usage_abs': vm_obj.summary.quickStats.overallCpuUsage or 0,
                     'memory_usage_abs': vm_obj.summary.quickStats.guestMemoryUsage or 0,
-                    'disk_io_usage_abs': rm_vm_metrics.get('disk_io_usage', 0.0),
-                    'network_io_usage_abs': rm_vm_metrics.get('network_io_usage', 0.0),
+                    'disk_io_usage_abs': io_metrics.get('disk_io_usage', 0.0),
+                    'network_io_usage_abs': io_metrics.get('network_io_usage', 0.0),
                     'vm_obj': vm_obj
                 }
             except AttributeError as ae:
-                logger.error(f"[ClusterState.annotate_vms] AttributeError while processing VM '{vm_name_for_log}' (Type: {type(vm_obj)}): {ae}")
+                logger.error(f"[ClusterState.annotate_vms] AttributeError for VM '{vm_name}': {ae}")
                 continue 
             except Exception as e:
-                logger.error(f"[ClusterState.annotate_vms] Unexpected error while processing VM '{vm_name_for_log}' (Type: {type(vm_obj)}): {e}")
+                logger.error(f"[ClusterState.annotate_vms] Error processing VM '{vm_name}': {e}")
                 continue
 
-        logger.info("[ClusterState] Finished annotation of VMs with metrics.")
+        logger.info(f"[ClusterState] Finished annotation of {len(self.vm_metrics)} VMs with metrics.")
 
     def annotate_hosts_with_metrics(self, resource_monitor):
         """

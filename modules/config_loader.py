@@ -1,8 +1,10 @@
 import yaml
 import logging
 import os
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger('fdrs')
+
 
 class ConfigLoader:
     """
@@ -10,8 +12,14 @@ class ConfigLoader:
     Provides default values if config file is missing or incomplete.
     """
     
-    # Default configuration values
-    DEFAULTS = {
+    # Default configuration values (immutable reference)
+    DEFAULTS: Dict[str, Dict[str, Any]] = {
+        'anti_affinity': {
+            'mode': 'strip_digits',
+            'regex_pattern': r'^(?P<prefix>.+?)[-_]?\d*$',
+            'min_name_length': 2,
+            'min_group_size': 2
+        },
         'storage': {
             'disk_io_capacity_mbps': 4000
         },
@@ -39,7 +47,9 @@ class ConfigLoader:
         }
     }
 
-    def __init__(self, config_file='config/fdrs_config.yaml'):
+    __slots__ = ('config_file', 'config')
+
+    def __init__(self, config_file: str = 'config/fdrs_config.yaml'):
         """
         Initialize config loader and load configuration.
         
@@ -144,9 +154,31 @@ class ConfigLoader:
         """Check if prefix caching is enabled."""
         return self.get('optimization', 'enable_prefix_cache', default=self.DEFAULTS['optimization']['enable_prefix_cache'])
 
+    # Anti-Affinity Configuration Methods
+    def get_anti_affinity_mode(self) -> str:
+        """Get anti-affinity prefix extraction mode ('strip_digits' or 'regex')."""
+        return self.get('anti_affinity', 'mode', default=self.DEFAULTS['anti_affinity']['mode'])
+
+    def get_anti_affinity_regex_pattern(self) -> str:
+        """Get custom regex pattern for prefix extraction."""
+        return self.get('anti_affinity', 'regex_pattern', default=self.DEFAULTS['anti_affinity']['regex_pattern'])
+
+    def get_anti_affinity_min_name_length(self) -> int:
+        """Get minimum VM name length for anti-affinity grouping."""
+        return self.get('anti_affinity', 'min_name_length', default=self.DEFAULTS['anti_affinity']['min_name_length'])
+
+    def get_anti_affinity_min_group_size(self) -> int:
+        """Get minimum group size to enforce anti-affinity rules."""
+        return self.get('anti_affinity', 'min_group_size', default=self.DEFAULTS['anti_affinity']['min_group_size'])
+
     def log_config(self):
         """Log loaded configuration for debugging."""
         logger.info("[ConfigLoader] Current Configuration:")
+        logger.info(f"  Anti-Affinity Mode: {self.get_anti_affinity_mode()}")
+        if self.get_anti_affinity_mode() == 'regex':
+            logger.info(f"  Anti-Affinity Regex: {self.get_anti_affinity_regex_pattern()}")
+        logger.info(f"  Anti-Affinity Min Name Length: {self.get_anti_affinity_min_name_length()}")
+        logger.info(f"  Anti-Affinity Min Group Size: {self.get_anti_affinity_min_group_size()}")
         logger.info(f"  Storage Disk I/O Capacity: {self.get_storage_disk_io_capacity()} MBps")
         logger.info(f"  Network Bandwidth: {self.get_network_bandwidth()} MBps")
         logger.info(f"  Migration Timeout: {self.get_migration_timeout()}s")

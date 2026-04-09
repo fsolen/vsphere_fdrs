@@ -1,20 +1,24 @@
 import logging
-import copy 
+import copy
+from typing import Dict, List, Tuple, Optional, Set, Any
 
 logger = logging.getLogger('fdrs')
 
 class MigrationManager:
-    def __init__(self, cluster_state, constraint_manager, load_evaluator, aggressiveness=3, max_total_migrations=20, ignore_anti_affinity=False, anti_affinity_only=False):
+    """Plans and manages VM migrations for load balancing and anti-affinity."""
+    
+    DEFAULT_MAX_MIGRATIONS = 20
+    
+    def __init__(self, cluster_state, constraint_manager, load_evaluator, 
+                 aggressiveness: int = 3, max_total_migrations: Optional[int] = None,
+                 ignore_anti_affinity: bool = False, anti_affinity_only: bool = False):
         self.cluster_state = cluster_state
         self.constraint_manager = constraint_manager
         self.load_evaluator = load_evaluator
         self.aggressiveness = aggressiveness
         self.ignore_anti_affinity = ignore_anti_affinity
-        self.anti_affinity_only = anti_affinity_only  # For apply-anti-affinity-only mode
-        if max_total_migrations is None:
-            self.max_total_migrations = 20
-        else:
-            self.max_total_migrations = int(max_total_migrations)
+        self.anti_affinity_only = anti_affinity_only
+        self.max_total_migrations = max_total_migrations if max_total_migrations is not None else self.DEFAULT_MAX_MIGRATIONS
 
     def _get_simulated_load_data_after_migrations(self, migrations_to_simulate):
         """
@@ -113,9 +117,13 @@ class MigrationManager:
         logger.debug(f"[MigrationPlanner_Sim] Simulation complete. New load map: {sim_host_resource_percentages_map}")
         return sim_cpu_percentages, sim_mem_percentages, orig_disk_percentages, orig_net_percentages, sim_host_resource_percentages_map
 
-    def _is_anti_affinity_safe(self, vm_to_move, target_host_obj, planned_migrations_in_cycle=None):
-        logger.debug(f"[MigrationPlanner] Checking anti-affinity safety for VM '{vm_to_move.name}' to host '{target_host_obj.name}'. Planned migrations in cycle: {planned_migrations_in_cycle}")
-        vm_prefix = vm_to_move.name[:-2]
+    def _get_vm_prefix(self, vm_name: str) -> str:
+        """Get VM prefix using constraint_manager's cached method."""
+        return self.constraint_manager._get_vm_prefix(vm_name)
+
+    def _is_anti_affinity_safe(self, vm_to_move, target_host_obj, planned_migrations_in_cycle=None) -> bool:
+        logger.debug(f"[MigrationPlanner] Checking anti-affinity safety for VM '{vm_to_move.name}' to host '{target_host_obj.name}'.")
+        vm_prefix = self._get_vm_prefix(vm_to_move.name)
         
         # Ensure vm_distribution is populated. It should be after constraint_manager.apply()
         if not self.constraint_manager.vm_distribution:
@@ -687,6 +695,30 @@ class MigrationManager:
         This method guarantees BOTH anti-affinity satisfaction AND resource balance by re-evaluating
         the cluster state after each planning pass and adjusting constraints if needed.
         
+        IMPORTANT - State Handling:
+        ---------------------------
+        This method uses SIMULATED state during planning. The actual vSphere cluster state is NOT
+        modified between iterations. Instead:
+        
+        1. Each iteration plans migrations based on the current simulated state
+        2. The simulations assume previous migrations would be executed
+        3. All migrations are accumulated and returned as a single batch
+        4. The scheduler (or dry-run) executes all migrations after planning completes
+        
+        This approach is:
+        - SAFE: No partial execution if planning fails mid-way
+        - EFFICIENT: Minimizes API calls to vSphere during planning
+        - PREDICTABLE: Each run produces deterministic results
+        
+        For true cluster state updates between iterations, execute migrations after each
+        plan_migrations() call instead of using this iterative method.
+        
+        Convergence Behavior:
+        --------------------
+        - Iteration 1: Uses original aggressiveness settings
+        - Iteration 2+: Loosens thresholds (aggressiveness / multiplier) to prevent deadlocks
+        - Stops early if: no migrations produced OR convergence achieved (no AA violations + balanced)
+        
         Args:
             max_iterations: Maximum number of planning iterations (default 3)
             anti_affinity_only: If True, only fix AA violations (skip balancing)
@@ -694,7 +726,7 @@ class MigrationManager:
                                           (e.g., 1.05 = 5% looser) to prevent deadlocks
         
         Returns:
-            List of migration tuples (vm_obj, target_host_obj) with convergence guarantee
+            List of migration tuples (vm_obj, target_host_obj) - all planned migrations across iterations
         """
         logger.info(f"[MigrationPlanner_Iterative] Starting iterative planning (max {max_iterations} iterations)...")
         
@@ -713,7 +745,7 @@ class MigrationManager:
             
             # Convergence check: If no AA violations AND balanced, we're done
             if not aa_violations and is_balanced:
-                logger.success(f"[MigrationPlanner_Iterative] ✓ CONVERGED at iteration {iteration}: No AA violations, cluster is balanced.")
+                logger.info(f"[MigrationPlanner_Iterative] CONVERGED at iteration {iteration}: No AA violations, cluster is balanced.")
                 logger.info(f"[MigrationPlanner_Iterative] Total migrations planned across all iterations: {len(all_migrations)}")
                 return all_migrations
             
@@ -774,6 +806,6 @@ class MigrationManager:
             
             try:
                 logger.info(f"Attempting migration of VM '{vm_obj.name}' from '{source_host_name}' to '{target_host_obj.name}'...")             
-                logger.success(f"SUCCESS: Migration of '{vm_obj.name}' from '{source_host_name}' to '{target_host_obj.name}' completed (simulated).")
+                logger.info(f"SUCCESS: Migration of '{vm_obj.name}' from '{source_host_name}' to '{target_host_obj.name}' completed (simulated).")
             except Exception as e:
                 logger.error(f"FAILED: Migration of '{vm_obj.name}' from '{source_host_name}' to '{target_host_obj.name}' failed: {str(e)}")

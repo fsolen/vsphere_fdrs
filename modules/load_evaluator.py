@@ -1,11 +1,29 @@
 import logging
+from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger('fdrs')
 
+# Aggressiveness to threshold mapping (immutable)
+AGGRESSIVENESS_THRESHOLDS = {
+    5: 5.0,
+    4: 10.0,
+    3: 15.0,
+    2: 20.0,
+    1: 25.0
+}
+DEFAULT_THRESHOLD = 15.0
+
 class LoadEvaluator:
-    def __init__(self, hosts):
+    """Evaluates load balance across cluster hosts."""
+    
+    __slots__ = ('hosts', '_cache_percentage_lists', 'cluster_totals', 'target_per_host', 'resource_deviations')
+    
+    def __init__(self, hosts: List[Dict[str, Any]]):
         self.hosts = hosts
-        self._cache_percentage_lists = None
+        self._cache_percentage_lists: Optional[Tuple] = None
+        self.cluster_totals: Dict[str, float] = {}
+        self.target_per_host: Dict[str, float] = {}
+        self.resource_deviations: Dict[str, List[float]] = {}
 
     def get_resource_percentage_lists(self):
         if self._cache_percentage_lists is not None:
@@ -53,26 +71,16 @@ class LoadEvaluator:
         self._cache_percentage_lists = (cpu_percentages, mem_percentages, disk_percentages, net_percentages)
         return self._cache_percentage_lists
 
-    def get_thresholds(self, aggressiveness=3):
-        mapping = {
-            5: 5.0,
-            4: 10.0,
-            3: 15.0,
-            2: 20.0,
-            1: 25.0
-        }
-        threshold_value = mapping.get(aggressiveness, 15.0) 
+    def get_thresholds(self, aggressiveness: int = 3) -> Dict[str, float]:
+        """Get threshold values based on aggressiveness level."""
+        threshold_value = AGGRESSIVENESS_THRESHOLDS.get(aggressiveness, DEFAULT_THRESHOLD)
         
-        if aggressiveness not in mapping:
-            logger.warning(f"[LoadEvaluator] Invalid aggressiveness level: {aggressiveness}. Defaulting to threshold: {threshold_value}%.")
+        if aggressiveness not in AGGRESSIVENESS_THRESHOLDS:
+            logger.warning(f"[LoadEvaluator] Invalid aggressiveness level: {aggressiveness}. Using default: {threshold_value}%")
 
-        thresholds = {
-            'cpu': threshold_value,
-            'memory': threshold_value,
-            'disk': threshold_value,
-            'network': threshold_value
-        }
-        logger.debug(f"[LoadEvaluator] Aggressiveness: {aggressiveness}, Max Difference Thresholds: {thresholds}")
+        # All resources use the same threshold
+        thresholds = dict.fromkeys(['cpu', 'memory', 'disk', 'network'], threshold_value)
+        logger.debug(f"[LoadEvaluator] Aggressiveness: {aggressiveness}, Thresholds: {threshold_value}%")
         return thresholds
 
     def evaluate_imbalance(self, metrics_to_check=None, aggressiveness=3,

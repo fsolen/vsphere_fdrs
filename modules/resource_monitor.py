@@ -1,34 +1,179 @@
 from pyVmomi import vim
-import time
 import logging
+from typing import Dict, Optional, Any, List, Tuple
 
 logger = logging.getLogger('fdrs')
 
+# Default capacities when config is not available
+DEFAULT_DISK_IO_CAPACITY = 4000  # MBps
+DEFAULT_NETWORK_CAPACITY = 1250.0  # MBps
+
+# Metrics we need to fetch
+METRICS_MAP = {
+    "cpu_usage": "cpu.usage",       # Percentage (0-10000)
+    "memory_usage": "mem.usage",    # Percentage (0-10000)
+    "disk_io_usage": "disk.usage",  # KBps
+    "network_io_usage": "net.usage" # KBps
+}
+
+
 class ResourceMonitor:
     """
-    Monitor resources (CPU, Memory, Disk I/O, Network I/O) of VMs and Hosts
+    Monitor resources (CPU, Memory, Disk I/O, Network I/O) of VMs and Hosts.
+    Uses vSphere Performance Manager for metrics collection with batch queries.
     """
+    
+    __slots__ = ('service_instance', 'performance_manager', 'counter_map', 'config', '_metric_cache')
 
     def __init__(self, service_instance, config=None):
         self.service_instance = service_instance
         self.performance_manager = service_instance.content.perfManager
         self.counter_map = self._build_counter_map()
         self.config = config
+        self._metric_cache: Dict[str, Dict] = {}  # Cache for repeated queries
 
-    def _build_counter_map(self):
+    def _build_counter_map(self) -> Dict[str, Optional[int]]:
         """
         Builds a map of performance counter names to IDs.
+        Only builds the counters we need for efficiency.
         """
         counter_map = {}
-        perf_dict = {}
-        perfList = self.performance_manager.perfCounter
-        for counter in perfList:
-            perf_dict[counter.groupInfo.key + "." + counter.nameInfo.key] = counter.key
-        counter_map['cpu.usage'] = perf_dict.get('cpu.usage')
-        counter_map['mem.usage'] = perf_dict.get('mem.usage')
-        counter_map['disk.usage'] = perf_dict.get('disk.usage')
-        counter_map['net.usage'] = perf_dict.get('net.usage')
+        perf_counters = self.performance_manager.perfCounter
+        
+        # Build a lookup dict once
+        perf_dict = {
+            f"{counter.groupInfo.key}.{counter.nameInfo.key}": counter.key
+            for counter in perf_counters
+        }
+        
+        # Map only the counters we need
+        needed_counters = ['cpu.usage', 'mem.usage', 'disk.usage', 'net.usage']
+        for counter_name in needed_counters:
+            counter_map[counter_name] = perf_dict.get(counter_name)
+            
         return counter_map
+
+    def _get_batch_performance_data(self, entities: List, metric_names: List[str], interval: int = 20) -> Dict[str, Dict[str, float]]:
+        """
+        Batch query performance data for multiple entities and metrics.
+        
+        This is significantly more efficient than individual queries when processing
+        many VMs or hosts, reducing API round-trips.
+        
+        Args:
+            entities: List of VM or Host managed objects
+            metric_names: List of metric names (e.g., ['cpu.usage', 'mem.usage'])
+            interval: Performance interval in seconds
+        
+        Returns:
+            Dict mapping entity names to metric values:
+            {'entity_name': {'cpu.usage': 50.0, 'mem.usage': 30.0, ...}, ...}
+        """
+        if not entities or not metric_names:
+            return {}
+
+        # Build metric IDs for all requested metrics
+        metric_ids = []
+        for metric_name in metric_names:
+            metric_id = self.counter_map.get(metric_name)
+            if metric_id:
+                metric_ids.append(vim.PerformanceManager.MetricId(counterId=metric_id, instance=''))
+
+        if not metric_ids:
+            logger.warning("[ResourceMonitor] No valid metric IDs found for batch query")
+            return {}
+
+        # Build query specs for all valid entities
+        query_specs = []
+        entity_name_map = {}  # Map index to entity name for result processing
+        
+        for entity in entities:
+            entity_name = getattr(entity, 'name', None)
+            if not entity_name:
+                continue
+            if not hasattr(entity, '_moId') or entity._moId is None:
+                logger.debug(f"[ResourceMonitor] Entity '{entity_name}' has no valid _moId, skipping batch query")
+                continue
+                
+            query_specs.append(
+                vim.PerformanceManager.QuerySpec(
+                    entity=entity,
+                    metricId=metric_ids,
+                    intervalId=interval,
+                    maxSample=1
+                )
+            )
+            entity_name_map[len(query_specs) - 1] = entity_name
+
+        if not query_specs:
+            return {}
+
+        # Execute batch query
+        results = {}
+        try:
+            query_results = self.performance_manager.QueryPerf(querySpec=query_specs)
+            
+            for idx, entity_result in enumerate(query_results):
+                entity_name = entity_name_map.get(idx)
+                if not entity_name:
+                    continue
+                    
+                results[entity_name] = {}
+                if entity_result.value:
+                    for metric_series in entity_result.value:
+                        # Find the metric name from counter ID
+                        counter_id = metric_series.id.counterId
+                        metric_name = None
+                        for name, cid in self.counter_map.items():
+                            if cid == counter_id:
+                                metric_name = name
+                                break
+                        
+                        if metric_name and metric_series.value:
+                            results[entity_name][metric_name] = metric_series.value[0] if metric_series.value[0] is not None else 0
+                
+                # Fill in missing metrics with 0
+                for metric_name in metric_names:
+                    if metric_name not in results[entity_name]:
+                        results[entity_name][metric_name] = 0
+                        
+            logger.debug(f"[ResourceMonitor] Batch query completed for {len(results)} entities")
+            
+        except Exception as e:
+            logger.warning(f"[ResourceMonitor] Batch query failed: {e}. Falling back to individual queries.")
+            # Fall back to individual queries
+            for entity in entities:
+                entity_name = getattr(entity, 'name', None)
+                if entity_name:
+                    results[entity_name] = {}
+                    for metric_name in metric_names:
+                        results[entity_name][metric_name] = self._get_performance_data(entity, metric_name, interval)
+        
+        return results
+
+    def get_batch_vm_metrics(self, vms: List) -> Dict[str, Dict[str, float]]:
+        """
+        Get metrics for multiple VMs in a single batch query.
+        
+        Args:
+            vms: List of VM managed objects
+        
+        Returns:
+            Dict mapping VM names to their metrics
+        """
+        metric_names = list(METRICS_MAP.values())
+        raw_metrics = self._get_batch_performance_data(vms, metric_names)
+        
+        # Convert raw metrics to expected format
+        processed = {}
+        for vm_name, metrics in raw_metrics.items():
+            processed[vm_name] = {
+                'cpu_usage': (metrics.get('cpu.usage', 0) or 0) / 100.0,
+                'memory_usage': (metrics.get('mem.usage', 0) or 0) / 100.0,
+                'disk_io_usage': (metrics.get('disk.usage', 0) or 0) / 1024.0,  # KBps to MBps
+                'network_io_usage': (metrics.get('net.usage', 0) or 0) / 1024.0  # KBps to MBps
+            }
+        return processed
 
     def _get_performance_data(self, entity, metric_name, interval=20):
         content = self.service_instance.RetrieveContent() 

@@ -1,47 +1,121 @@
 import logging
+import re
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Pattern
 
 logger = logging.getLogger('fdrs')
 
 class ConstraintManager:
-    def __init__(self, cluster_state):
+    """Manages anti-affinity constraints based on VM name prefixes.
+    
+    Supports two prefix extraction modes (configurable via config):
+    - strip_digits: Removes trailing digits from VM names (e.g., webserver01 -> webserver)
+    - regex: Uses a custom regex pattern with named group 'prefix'
+    """
+    
+    def __init__(self, cluster_state, config=None):
         self.cluster_state = cluster_state
-        self.vm_distribution = {}
-        self.violations = []
-        self._vm_prefix_cache = {} 
+        self.config = config
+        self.vm_distribution: Dict[str, List] = {}
+        self.violations: List = []
+        self._vm_prefix_cache: Dict[str, str] = {}
+        
+        # Initialize prefix extraction based on config
+        self._prefix_mode = 'strip_digits'
+        self._prefix_regex: Optional[Pattern] = None
+        self._min_name_length = 2
+        self._min_group_size = 2
+        
+        if config:
+            self._prefix_mode = config.get_anti_affinity_mode()
+            self._min_name_length = config.get_anti_affinity_min_name_length()
+            self._min_group_size = config.get_anti_affinity_min_group_size()
+            
+            if self._prefix_mode == 'regex':
+                try:
+                    pattern = config.get_anti_affinity_regex_pattern()
+                    self._prefix_regex = re.compile(pattern)
+                    logger.info(f"[ConstraintManager] Using regex pattern for prefix extraction: {pattern}")
+                except re.error as e:
+                    logger.error(f"[ConstraintManager] Invalid regex pattern: {e}. Falling back to strip_digits mode.")
+                    self._prefix_mode = 'strip_digits'
+        
+        logger.debug(f"[ConstraintManager] Prefix mode: {self._prefix_mode}, min_name_length: {self._min_name_length}, min_group_size: {self._min_group_size}")
 
 
-    def _get_vm_prefix(self, vm_name):
-        """Cache prefix extraction for faster lookups."""
-        if vm_name not in self._vm_prefix_cache:
-            self._vm_prefix_cache[vm_name] = vm_name.rstrip('0123456789') or vm_name
-        return self._vm_prefix_cache[vm_name]
+    def _get_vm_prefix(self, vm_name: str) -> str:
+        """Extract prefix from VM name using configured method.
+        
+        Supports:
+        - strip_digits: Removes trailing digits (webserver01 -> webserver)
+        - regex: Custom pattern with named group 'prefix'
+        
+        Results are cached for performance.
+        """
+        if vm_name in self._vm_prefix_cache:
+            return self._vm_prefix_cache[vm_name]
+        
+        prefix = vm_name  # Default fallback
+        
+        if self._prefix_mode == 'regex' and self._prefix_regex:
+            match = self._prefix_regex.match(vm_name)
+            if match and 'prefix' in match.groupdict():
+                prefix = match.group('prefix') or vm_name
+            else:
+                # Regex didn't match, fall back to strip_digits
+                prefix = vm_name.rstrip('0123456789') or vm_name
+        else:
+            # Default strip_digits mode
+            prefix = vm_name.rstrip('0123456789') or vm_name
+        
+        self._vm_prefix_cache[vm_name] = prefix
+        return prefix
 
-    def enforce_anti_affinity(self):
-        '''
-        Groups VMs by prefix (ignoring trailing digits).
-        This populates self.vm_distribution.
-        '''
+    def enforce_anti_affinity(self) -> None:
+        """Groups VMs by prefix for anti-affinity rules.
+        
+        Uses configured extraction method and filters by min_name_length.
+        Groups smaller than min_group_size are excluded from anti-affinity enforcement.
+        """
         logger.info("[ConstraintManager] Grouping VMs by prefix for Anti-Affinity rules...")
-        self.vm_distribution = {}
+        self.vm_distribution = defaultdict(list)
         all_vms = self.cluster_state.vms
     
         if not all_vms:
             logger.info("[ConstraintManager] No VMs found in cluster state.")
+            self.vm_distribution = dict(self.vm_distribution)
             return
     
         for vm in all_vms:
-            if not hasattr(vm, 'name') or not isinstance(vm.name, str) or len(vm.name) < 1:
-                logger.warning(f"[ConstraintManager] VM with invalid name or missing name attribute skipped: {getattr(vm, 'name', 'UnknownVM')}")
+            vm_name = getattr(vm, 'name', None)
+            if not vm_name or not isinstance(vm_name, str):
+                logger.warning(f"[ConstraintManager] VM with invalid name skipped: {vm_name}")
+                continue
+            
+            # Skip VMs with names shorter than minimum length
+            if len(vm_name) < self._min_name_length:
+                logger.debug(f"[ConstraintManager] VM '{vm_name}' skipped (name length < {self._min_name_length})")
                 continue
     
-            short_name = self._get_vm_prefix(vm.name)
+            prefix = self._get_vm_prefix(vm_name)
+            self.vm_distribution[prefix].append(vm)
     
-            # Add VM to the group
-            self.vm_distribution.setdefault(short_name, []).append(vm)
+        # Filter out groups smaller than min_group_size
+        if self._min_group_size > 1:
+            original_count = len(self.vm_distribution)
+            self.vm_distribution = {
+                k: v for k, v in self.vm_distribution.items() 
+                if len(v) >= self._min_group_size
+            }
+            filtered_count = original_count - len(self.vm_distribution)
+            if filtered_count > 0:
+                logger.debug(f"[ConstraintManager] Filtered out {filtered_count} groups with < {self._min_group_size} VMs")
+        else:
+            self.vm_distribution = dict(self.vm_distribution)
     
-        # Properly format and print the distribution
-        grouped_info = {k: [v.name for v in vms] for k, vms in self.vm_distribution.items()}
-        logger.debug(f"[ConstraintManager] Grouped VMs by prefix: {grouped_info}")
+        if logger.isEnabledFor(logging.DEBUG):
+            grouped_info = {k: [v.name for v in vms] for k, vms in self.vm_distribution.items()}
+            logger.debug(f"[ConstraintManager] Grouped VMs by prefix: {grouped_info}")
 
     def calculate_anti_affinity_violations(self):
         # Escaped internal double quotes
